@@ -470,10 +470,12 @@ class Memory(MemoryBase):
         if filters.get("run_id"):
             search_filters["run_id"] = filters["run_id"]
         for new_mem in new_retrieved_facts:
-            messages_embeddings = self.embedding_model.embed(new_mem, "add")
-            new_message_embeddings[new_mem] = messages_embeddings
+            # Handle cases where the fact is returned as a dict
+            fact_text = new_mem.get("fact") if isinstance(new_mem, dict) else new_mem
+            messages_embeddings = self.embedding_model.embed(fact_text, "add")
+            new_message_embeddings[fact_text] = messages_embeddings
             existing_memories = self.vector_store.search(
-                query=new_mem,
+                query=fact_text,
                 vectors=messages_embeddings,
                 limit=5,
                 filters=search_filters,
@@ -1046,13 +1048,19 @@ class Memory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"})
-        # delete all vector memories and reset the collections
-        memories = self.vector_store.list(filters=filters, limit=None)[0]
-        for memory in memories:
+        # delete all vector memories and reset the collections (handle varied return formats)
+        memories_result = self.vector_store.list(filters=filters, limit=None)
+        if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
+            first_element = memories_result[0]
+            actual_memories = first_element if isinstance(first_element, (list, tuple)) else memories_result
+        else:
+            actual_memories = memories_result
+
+        for memory in actual_memories:
             self._delete_memory(memory.id)
         self.vector_store.reset()
 
-        logger.info(f"Deleted {len(memories)} memories")
+        logger.info(f"Deleted {len(actual_memories)} memories")
 
         if self.enable_graph:
             self.graph.delete_all(filters)
@@ -1456,11 +1464,8 @@ class AsyncMemory(MemoryBase):
             return returned_memories
 
         parsed_messages = parse_messages(messages)
-        if custom_extraction_prompt:
-            system_prompt = custom_extraction_prompt
-            user_prompt = f"Input:\n{parsed_messages}"
-        elif self.config.custom_fact_extraction_prompt:
-            system_prompt = self.config.custom_fact_extraction_prompt
+        if custom_extraction_prompt or self.config.custom_fact_extraction_prompt:
+            system_prompt = custom_extraction_prompt or self.config.custom_fact_extraction_prompt
             user_prompt = f"Input:\n{parsed_messages}"
         else:
             # Determine if this should use agent memory extraction based on agent_id presence
@@ -2115,15 +2120,19 @@ class AsyncMemory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"})
-        memories = await asyncio.to_thread(self.vector_store.list, filters=filters, limit=None)
+        memories_result = await asyncio.to_thread(self.vector_store.list, filters=filters, limit=None)
 
-        delete_tasks = []
-        for memory in memories[0]:
-            delete_tasks.append(self._delete_memory(memory.id))
+        # Handle different vector store return formats
+        if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
+            first_element = memories_result[0]
+            actual_memories = first_element if isinstance(first_element, (list, tuple)) else memories_result
+        else:
+            actual_memories = memories_result
 
+        delete_tasks = [self._delete_memory(memory.id) for memory in actual_memories]
         await asyncio.gather(*delete_tasks)
 
-        logger.info(f"Deleted {len(memories[0])} memories")
+        logger.info(f"Deleted {len(actual_memories)} memories")
 
         if self.enable_graph:
             await asyncio.to_thread(self.graph.delete_all, filters)
