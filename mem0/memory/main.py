@@ -470,10 +470,12 @@ class Memory(MemoryBase):
         if filters.get("run_id"):
             search_filters["run_id"] = filters["run_id"]
         for new_mem in new_retrieved_facts:
-            messages_embeddings = self.embedding_model.embed(new_mem, "add")
-            new_message_embeddings[new_mem] = messages_embeddings
+            # Handle cases where the fact is returned as a dict
+            fact_text = new_mem.get("fact") if isinstance(new_mem, dict) else new_mem
+            messages_embeddings = self.embedding_model.embed(fact_text, "add")
+            new_message_embeddings[fact_text] = messages_embeddings
             existing_memories = self.vector_store.search(
-                query=new_mem,
+                query=fact_text,
                 vectors=messages_embeddings,
                 limit=5,
                 filters=search_filters,
@@ -1046,13 +1048,19 @@ class Memory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"})
-        # delete all vector memories and reset the collections
-        memories = self.vector_store.list(filters=filters)[0]
-        for memory in memories:
+        # delete all vector memories and reset the collections (handle varied return formats)
+        memories_result = self.vector_store.list(filters=filters, limit=None)
+        if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
+            first_element = memories_result[0]
+            actual_memories = first_element if isinstance(first_element, (list, tuple)) else memories_result
+        else:
+            actual_memories = memories_result
+
+        for memory in actual_memories:
             self._delete_memory(memory.id)
         self.vector_store.reset()
 
-        logger.info(f"Deleted {len(memories)} memories")
+        logger.info(f"Deleted {len(actual_memories)} memories")
 
         if self.enable_graph:
             self.graph.delete_all(filters)
@@ -1340,6 +1348,7 @@ class AsyncMemory(MemoryBase):
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
         llm=None,
+        **kwargs,
     ):
         """
         Create a new memory asynchronously.
@@ -1355,9 +1364,12 @@ class AsyncMemory(MemoryBase):
                                          Pass "procedural_memory" to create procedural memories.
             prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
             llm (BaseChatModel, optional): LLM class to use for generating procedural memories. Defaults to None. Useful when user is using LangChain ChatModel.
+            **kwargs: Additional parameters. Supported: custom_extraction_prompt (str) - Custom prompt for fact extraction.
         Returns:
             dict: A dictionary containing the result of the memory addition operation.
         """
+        custom_extraction_prompt = kwargs.get('custom_extraction_prompt', None)
+        
         processed_metadata, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_metadata=metadata
         )
@@ -1393,7 +1405,7 @@ class AsyncMemory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         vector_store_task = asyncio.create_task(
-            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer)
+            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, custom_extraction_prompt)
         )
         graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
 
@@ -1413,6 +1425,7 @@ class AsyncMemory(MemoryBase):
         metadata: dict,
         effective_filters: dict,
         infer: bool,
+        custom_extraction_prompt: Optional[str] = None,
     ):
         if not infer:
             returned_memories = []
@@ -1451,8 +1464,8 @@ class AsyncMemory(MemoryBase):
             return returned_memories
 
         parsed_messages = parse_messages(messages)
-        if self.config.custom_fact_extraction_prompt:
-            system_prompt = self.config.custom_fact_extraction_prompt
+        if custom_extraction_prompt or self.config.custom_fact_extraction_prompt:
+            system_prompt = custom_extraction_prompt or self.config.custom_fact_extraction_prompt
             user_prompt = f"Input:\n{parsed_messages}"
         else:
             # Determine if this should use agent memory extraction based on agent_id presence
@@ -1497,11 +1510,13 @@ class AsyncMemory(MemoryBase):
             search_filters["run_id"] = effective_filters["run_id"]
 
         async def process_fact_for_search(new_mem_content):
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, new_mem_content, "add")
-            new_message_embeddings[new_mem_content] = embeddings
+            # Extract fact text if new_mem_content is a dict
+            fact_text = new_mem_content.get('fact') if isinstance(new_mem_content, dict) else new_mem_content
+            embeddings = await asyncio.to_thread(self.embedding_model.embed, fact_text, "add")
+            new_message_embeddings[fact_text] = embeddings
             existing_mems = await asyncio.to_thread(
                 self.vector_store.search,
-                query=new_mem_content,
+                query=fact_text,
                 vectors=embeddings,
                 limit=5,
                 filters=search_filters,
@@ -2105,15 +2120,19 @@ class AsyncMemory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"})
-        memories = await asyncio.to_thread(self.vector_store.list, filters=filters)
+        memories_result = await asyncio.to_thread(self.vector_store.list, filters=filters, limit=None)
 
-        delete_tasks = []
-        for memory in memories[0]:
-            delete_tasks.append(self._delete_memory(memory.id))
+        # Handle different vector store return formats
+        if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
+            first_element = memories_result[0]
+            actual_memories = first_element if isinstance(first_element, (list, tuple)) else memories_result
+        else:
+            actual_memories = memories_result
 
+        delete_tasks = [self._delete_memory(memory.id) for memory in actual_memories]
         await asyncio.gather(*delete_tasks)
 
-        logger.info(f"Deleted {len(memories[0])} memories")
+        logger.info(f"Deleted {len(actual_memories)} memories")
 
         if self.enable_graph:
             await asyncio.to_thread(self.graph.delete_all, filters)
